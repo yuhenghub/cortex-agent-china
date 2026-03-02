@@ -1,0 +1,283 @@
+# Agent Intelligence V3.2 (智能分析助手)
+
+> Snowflake China Intelligence 的核心组件 - 为 Snowflake 中国区提供自然语言数据分析能力
+> 
+> **Version 3.2** - Agent Chat + Data Insights 双模块多轮对话，个性化问候
+
+## 🏗️ 系统架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   Snowflake China Intelligence V3.2                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                    Streamlit in Snowflake (SiS)                      │    │
+│  │                                                                      │    │
+│  │  ┌──────────────────────────────────────────────────────────────┐   │    │
+│  │  │            Personalized Greeting (First Name)                 │   │    │
+│  │  │        "Good morning, {FirstName}! What insights..."         │   │    │
+│  │  └──────────────────────────────────────────────────────────────┘   │    │
+│  │                                                                      │    │
+│  │  ┌─────────────────────────┐  ┌─────────────────────────────────┐   │    │
+│  │  │     🤖 Agent Chat       │  │       📈 Data Insights          │   │    │
+│  │  │    (工具调用多轮)         │  │   (SQL+数据+洞察 多轮 Deep Dive) │   │    │
+│  │  │  ┌───────────────────┐  │  │  ┌───────────────────────────┐  │   │    │
+│  │  │  │ execute_sql       │  │  │  │ Auto SQL Generation       │  │   │    │
+│  │  │  │ get_table_info    │  │  │  │ Query Execution           │  │   │    │
+│  │  │  └───────────────────┘  │  │  │ AI Insights Generation    │  │   │    │
+│  │  └────────────┬────────────┘  │  │ Follow-up Deep Dive       │  │   │    │
+│  │               │               │  └────────────┬──────────────┘  │   │    │
+│  │               │               └───────────────┼─────────────────┘   │    │
+│  │               │                               │                      │    │
+│  │  ┌────────────▼───────────────────────────────▼──────────────────┐  │    │
+│  │  │              Context Manager (独立上下文管理)                   │  │    │
+│  │  │  ┌───────────────┐  ┌───────────────┐  ┌───────────────────┐  │  │    │
+│  │  │  │ Agent History │  │Insights Hist. │  │  Semantic Model   │  │  │    │
+│  │  │  │  (独立存储)    │  │  (独立存储)    │  │   (共享)          │  │  │    │
+│  │  │  └───────────────┘  └───────────────┘  └───────────────────┘  │  │    │
+│  │  └───────────────────────────┬────────────────────────────────────┘ │    │
+│  └──────────────────────────────┼──────────────────────────────────────┘    │
+│                                 ▼                                           │
+│  ┌──────────────────────────────────────────────────────────────────────┐   │
+│  │                      Snowflake Data Layer                             │   │
+│  │  ┌───────────────────────────────────────────────────────────────┐   │   │
+│  │  │                   Chat History Schema                          │   │   │
+│  │  │  ┌──────────────────────┐  ┌──────────────────────────────┐   │   │   │
+│  │  │  │ AGENT_CHAT_SESSIONS  │  │    INSIGHTS_SESSIONS          │   │   │   │
+│  │  │  │ AGENT_CHAT_MESSAGES  │  │    INSIGHTS_MESSAGES          │   │   │   │
+│  │  │  │  (Agent专用)          │  │    (Insights专用)             │   │   │   │
+│  │  │  └──────────────────────┘  └──────────────────────────────┘   │   │   │
+│  │  └───────────────────────────────────────────────────────────────┘   │   │
+│  └──────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 🔄 多轮对话实现原理
+
+### 核心设计
+
+多轮对话的关键在于**如何将历史对话有效地传递给 LLM**，同时控制 token 消耗。
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                    Multi-turn Conversation Flow                     │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  User Question ──────────────────────────────────────┐              │
+│                                                       │              │
+│                                                       ▼              │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                  format_history_for_prompt()                 │   │
+│  │                                                              │   │
+│  │   Session State                                              │   │
+│  │   ┌─────────────────────────────────────────────────────┐   │   │
+│  │   │ messages: [                                          │   │   │
+│  │   │   {role: "user", content: "销售额是多少?"},           │   │   │
+│  │   │   {role: "assistant", content: "查询结果..."},        │   │   │
+│  │   │   {role: "user", content: "按月份分组"},              │   │   │
+│  │   │   {role: "assistant", content: "月度数据..."},        │   │   │
+│  │   │   ...                                                │   │   │
+│  │   │ ]                                                    │   │   │
+│  │   └─────────────────────────────────────────────────────┘   │   │
+│  │                         │                                    │   │
+│  │                         ▼                                    │   │
+│  │   ┌─────────────────────────────────────────────────────┐   │   │
+│  │   │  1. 取最近 N 条消息 (MAX_HISTORY_MESSAGES=20)         │   │   │
+│  │   │  2. 从最新到最旧遍历，累计字符数                        │   │   │
+│  │   │  3. 超过 MAX_HISTORY_CHARS=8000 时停止                │   │   │
+│  │   │  4. 长消息截断为 500 字符 + "...[truncated]"          │   │   │
+│  │   └─────────────────────────────────────────────────────┘   │   │
+│  └──────────────────────────────┬──────────────────────────────┘   │
+│                                 │                                   │
+│                                 ▼                                   │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                     Final Prompt Structure                   │   │
+│  │  ┌────────────────────────────────────────────────────────┐ │   │
+│  │  │ ## Previous Conversation:                              │ │   │
+│  │  │ [User]: 销售额是多少?                                   │ │   │
+│  │  │ [Assistant]: 根据查询，总销售额为...                     │ │   │
+│  │  │ [User]: 按月份分组                                      │ │   │
+│  │  │ [Assistant]: 月度销售数据如下...                        │ │   │
+│  │  │                                                        │ │   │
+│  │  │ ---                                                    │ │   │
+│  │  │ [Context: Last query returned 12 rows with columns:    │ │   │
+│  │  │  month, total_sales, order_count]                      │ │   │
+│  │  │                                                        │ │   │
+│  │  │ [Current Question]: 哪个月销售最高?                     │ │   │
+│  │  └────────────────────────────────────────────────────────┘ │   │
+│  └──────────────────────────────┬──────────────────────────────┘   │
+│                                 │                                   │
+│                                 ▼                                   │
+│                          LLM Response                               │
+│                                 │                                   │
+│                                 ▼                                   │
+│                    Save to Session + Database                       │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+### 代码实现
+
+```python
+def format_history_for_prompt(messages: List[Dict], 
+                              max_messages: int = 20,
+                              max_chars: int = 8000) -> str:
+    """
+    格式化对话历史用于 Prompt
+    
+    策略：
+    1. 取最近 N 条消息（优先保留最新的上下文）
+    2. 从新到旧遍历，累计字符数
+    3. 超过字符限制时停止（避免超出 token 限制）
+    4. 长消息自动截断
+    """
+    if not messages:
+        return ""
+    
+    # 取最近 N 条
+    recent_messages = messages[-max_messages:]
+    
+    formatted_parts = []
+    total_chars = 0
+    
+    # 从最新到最旧遍历（保证最新的对话一定会被包含）
+    for msg in reversed(recent_messages):
+        role = "User" if msg["role"] == "user" else "Assistant"
+        content = msg.get("content", "")
+        
+        # 截断过长消息
+        if len(content) > 500:
+            content = content[:500] + "...[truncated]"
+        
+        part = f"[{role}]: {content}"
+        
+        # 检查是否超出字符限制
+        if total_chars + len(part) > max_chars:
+            break
+        
+        formatted_parts.insert(0, part)  # 插入到开头保持顺序
+        total_chars += len(part)
+    
+    if formatted_parts:
+        return "## Previous Conversation:\n" + "\n\n".join(formatted_parts) + "\n\n---\n"
+    return ""
+```
+
+### 持久化存储
+
+对话历史存储在 **同一 Schema 下的不同表**，Agent Chat 和 Data Insights 独立管理：
+
+```sql
+-- ========== Agent Chat 存储 ==========
+CREATE TABLE AGENT_CHAT_SESSIONS (
+    session_id VARCHAR(36) PRIMARY KEY,
+    user_id VARCHAR(255),
+    title VARCHAR(500),
+    created_at TIMESTAMP_NTZ,
+    updated_at TIMESTAMP_NTZ,
+    semantic_model_name VARCHAR(255),
+    message_count INTEGER
+);
+
+CREATE TABLE AGENT_CHAT_MESSAGES (
+    message_id VARCHAR(36) PRIMARY KEY,
+    session_id VARCHAR(36),
+    role VARCHAR(20),           -- user / assistant
+    content TEXT,
+    tool_info TEXT,             -- 工具调用 JSON
+    query_result TEXT,          -- 查询结果 JSON
+    created_at TIMESTAMP_NTZ
+);
+
+-- ========== Data Insights 存储 ==========
+CREATE TABLE INSIGHTS_SESSIONS (
+    session_id VARCHAR(36) PRIMARY KEY,
+    user_id VARCHAR(255),
+    title VARCHAR(500),
+    created_at TIMESTAMP_NTZ,
+    updated_at TIMESTAMP_NTZ,
+    semantic_model_name VARCHAR(255),
+    message_count INTEGER
+);
+
+CREATE TABLE INSIGHTS_MESSAGES (
+    message_id VARCHAR(36) PRIMARY KEY,
+    session_id VARCHAR(36),
+    role VARCHAR(20),
+    content TEXT,
+    sql_query TEXT,             -- 执行的 SQL
+    query_result TEXT,          -- 数据结果 JSON
+    insights TEXT,              -- AI 洞察内容
+    created_at TIMESTAMP_NTZ
+);
+```
+
+## 📁 文件说明
+
+| 文件 | 说明 |
+|------|------|
+| `cortex_agent_sis_v2.py` | 主应用文件 (Streamlit in Snowflake) V3 |
+| `environment.yml` | SiS 依赖配置 |
+| `setup_qwen_udf.sql` | 外部 API UDF 部署脚本 |
+| `RELEASE_NOTES.md` | 版本发布说明 |
+
+## 🚀 快速部署
+
+### 使用 Snow CLI 部署
+
+```bash
+# 1. 上传文件到 Stage
+snow stage copy cortex_agent_sis_v2.py @YOUR_DB.YOUR_SCHEMA.STAGE/ --connection your_conn --overwrite
+snow stage copy environment.yml @YOUR_DB.YOUR_SCHEMA.STAGE/ --connection your_conn --overwrite
+
+# 2. 创建 Streamlit 应用
+snow sql -q "
+CREATE OR REPLACE STREAMLIT YOUR_DB.YOUR_SCHEMA.CHINA_INTELLIGENCE_V3
+ROOT_LOCATION = '@YOUR_DB.YOUR_SCHEMA.STAGE'
+MAIN_FILE = 'cortex_agent_sis_v2.py'
+TITLE = 'Snowflake China Intelligence V3'
+QUERY_WAREHOUSE = YOUR_WAREHOUSE
+EXTERNAL_ACCESS_INTEGRATIONS = (your_integration)
+" --connection your_conn
+```
+
+### 启用历史记录
+
+打开应用后，在侧边栏 **💬 Conversations** 区域：
+1. 选择存储历史的 **Database** 和 **Schema**
+2. 点击 **✅ Configure & Setup Tables**
+3. 系统自动创建 4 张表并显示历史会话列表
+
+## 🧠 支持的模型
+
+| 后端 | 模型 | 说明 |
+|------|------|------|
+| **External API** | qwen-max | 最强大，适合复杂任务 |
+| | qwen-plus | 平衡性价比 |
+| | qwen-turbo | 快速响应 |
+| | deepseek-chat | DeepSeek-V3 |
+| | deepseek-reasoner | DeepSeek-R1 深度推理 |
+| **SPCS** | Qwen2.5-1.5B-Instruct | 私有化部署，数据不出云 |
+
+## 📚 V3.2 新功能
+
+| 功能 | 说明 |
+|------|------|
+| **个性化问候** | 根据 First Name 显示 "Good morning, John" |
+| **Insights 多轮对话** | Data Insights 支持 Deep Dive，基于前次结果追问 |
+| **独立会话管理** | Agent Chat 和 Insights 各自独立的历史存储 |
+| **分表存储** | 同一 Schema 下 4 张表：Agent (2张) + Insights (2张) |
+| **简化配置** | Conversations 区域一站式配置历史存储 |
+| **自动加载历史** | 配置完成后自动显示历史会话列表 |
+
+## ⚠️ 注意事项
+
+- 需要通义千问 API Key 或 SPCS 私有化服务
+- 历史记录功能需要在选定 Schema 中创建表
+- 多轮对话默认保留最近 20 条消息 / 8000 字符
+
+## 🔗 相关文档
+
+- [Release Notes](./RELEASE_NOTES.md) - 版本发布说明
+- [主项目 README](../README.md) - Snowflake China Intelligence 总览
+- [SPCS 私有化部署](../spcs_china/README.md) - 私有化 LLM 服务部署指南
